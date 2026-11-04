@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wind-broker"
+version = "1.0.0"
+description = "Machine-wide persistent WindPy session daemon (windd) and drop-in client SDK"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pandas>=1.5"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+windd = "wind_broker.daemon:main"
+windctl = "wind_broker.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["wind_broker_client"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.pyright]
+extraPaths = ["src"]
