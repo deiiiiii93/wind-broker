@@ -45,7 +45,8 @@ class BrokerError(Exception):
     """A failure with an HTTP status and machine-readable kind."""
 
     STATUS = {"vendor": 422, "exception": 400, "bad_request": 400, "login": 401,
-              "timeout": 504, "crashed": 502, "invalid": 502, "busy": 503, "sdk_missing": 503}
+              "timeout": 504, "crashed": 502, "invalid": 502, "busy": 503, "sdk_missing": 503,
+              "not_connected": 503, "not_found": 404, "unauthorized": 401, "forbidden": 403}
 
     def __init__(self, message: str, *, kind: str, code: int | None = None):
         super().__init__(message)
@@ -382,8 +383,14 @@ class Broker:
         return directory / f"{key}.json"
 
     def call(self, method: str, args: list | None = None, kwargs: dict | None = None, *, client: str = "unknown",
-             request_seconds: float | None = None, usedf: bool = True) -> tuple[Any, str]:
-        """Run one SDK call. Returns (DataFrame | WindData payload, source)."""
+             request_seconds: float | None = None, usedf: bool = True,
+             allow_login: bool = True) -> tuple[Any, str]:
+        """Run one SDK call. Returns (DataFrame | WindData payload, source).
+
+        ``allow_login=False`` (LAN router callers) fails with ``not_connected``
+        instead of logging in, so a workstation can never raise a QR window on
+        the hub.
+        """
 
         call_args: list = plain_args(list(args or []))
         call_kwargs: dict = plain_args(dict(kwargs or {}))
@@ -417,6 +424,9 @@ class Broker:
             self._acquire(self.config.startup_seconds + seconds + 30)
             try:
                 if self.state != "connected" or not self._worker_alive():
+                    if not allow_login:
+                        raise BrokerError("the hub's Wind session is not logged in; log in on the hub "
+                                          "(WindBroker app or `windctl login`)", kind="not_connected")
                     self._login_locked()  # auto-connect on first use
                 result = self._exchange("call", {"method": method, "args": call_args, "kwargs": call_kwargs, "usedf": usedf},
                                         seconds, f"Wind {method}")
@@ -508,7 +518,9 @@ class Broker:
         # Timeouts, cache dir and auto-connect apply live; listener and SDK
         # paths are kept until restart so the running session is untouched.
         live = {k: getattr(candidate, k) for k in ("startup_seconds", "request_seconds",
-                                                    "auto_connect_on_start", "history_cache_dir")}
+                                                    "auto_connect_on_start", "history_cache_dir",
+                                                    "router_enabled", "router_host", "router_port",
+                                                    "router_max_inflight")}
         for key, value in live.items():
             setattr(self.config, key, value)
         return {"ok": True, "config": candidate.to_dict(), "restart_required": restart}

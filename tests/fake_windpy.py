@@ -58,6 +58,8 @@ class SDK:
             return -103, pd.DataFrame({"ERROR": ["not logged in"]})
         if "HANG" in str(codes):
             time.sleep(3600)
+        if "SLOW" in str(codes):
+            time.sleep(1.0)  # slow but within request_seconds: the session survives
         if "CRASH" in str(codes):
             os._exit(11)
         if "PYERR" in str(codes):

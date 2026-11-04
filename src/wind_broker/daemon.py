@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hmac
-import json
 import logging
 import os
 import signal
@@ -12,45 +11,23 @@ import socket
 import socketserver
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .broker import Broker, BrokerError
-from .codec import encode_frame, tag_tree, untag_tree
 from .config import LOOPBACK_HOSTS, broker_home, config_path, ensure_home, ensure_token, load_config
+from .http_common import JSONHandler, run_call
+from .router import Router
 
 log = logging.getLogger("windd")
-MAX_BODY = 8 * 1024 * 1024
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = f"windd/{__version__}"
-    protocol_version = "HTTP/1.1"
+class Handler(JSONHandler):
     broker: Broker
     daemon: "Daemon"
-
-    # Unix-socket peers have no (host, port) tuple.
-    def address_string(self) -> str:  # noqa: D401
-        return self.client_address[0] if isinstance(self.client_address, tuple) else "unix"
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
-        log.debug("%s %s", self.address_string(), format % args)
-
-    # ------------------------------------------------------------- plumbing
-    def _send(self, status: int, body: dict[str, Any]) -> None:
-        payload = json.dumps(body, ensure_ascii=False, default=str).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _error(self, exc: BrokerError) -> None:
-        self._send(exc.http_status, {"ok": False, "error": exc.to_dict()})
 
     def _guard(self) -> bool:
         """Reject browser-originated requests (CSRF / DNS rebinding).
@@ -66,44 +43,21 @@ class Handler(BaseHTTPRequestHandler):
                 else (self.headers.get("Host") or "").split("]")[0] + "]"
             allowed = LOOPBACK_HOSTS | {self.daemon.config.host}
             if host not in allowed:
-                self._send(403, {"ok": False, "error": {"kind": "forbidden", "code": None,
-                                                        "message": f"Host {host!r} not allowed"}})
+                self._fail(403, "forbidden", f"Host {host!r} not allowed")
                 return False
             # Every local account can reach loopback TCP, so TCP callers must
             # prove they can read the owner-only token file. The Unix socket
             # (mode 0600 in a 0700 directory) is already owner-only.
             if not self._token_ok():
-                self._send(401, {"ok": False, "error": {"kind": "unauthorized", "code": None,
-                                                        "message": "missing or invalid token; send "
-                                                                   "'Authorization: Bearer <~/.wind-broker/token>'"}})
+                self._fail(401, "unauthorized",
+                           "missing or invalid token; send 'Authorization: Bearer <~/.wind-broker/token>'")
                 return False
-        if self.command == "POST":
-            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if ctype != "application/json":
-                self._send(415, {"ok": False, "error": {"kind": "bad_request", "code": None,
-                                                        "message": "POST requires Content-Type: application/json"}})
-                return False
+        if self.command == "POST" and not self._json_post_ok():
+            return False
         return True
 
     def _token_ok(self) -> bool:
-        header = self.headers.get("Authorization") or ""
-        supplied = header[7:].strip() if header[:7].lower() == "bearer " else (self.headers.get("X-Wind-Token") or "")
-        return hmac.compare_digest(supplied.encode(), self.daemon.token.encode())
-
-    def _body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_BODY:
-            raise BrokerError("request body too large", kind="bad_request")
-        raw = self.rfile.read(length) if length else b""
-        if not raw.strip():
-            return {}
-        try:
-            body = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise BrokerError(f"invalid JSON body: {exc}", kind="bad_request") from exc
-        if not isinstance(body, dict):
-            raise BrokerError("JSON body must be an object", kind="bad_request")
-        return body
+        return hmac.compare_digest(self._supplied_token().encode(), self.daemon.token.encode())
 
     def _client_name(self, body: dict[str, Any]) -> str:
         return str(body.get("client") or self.headers.get("X-Wind-Client") or self.headers.get("User-Agent")
@@ -117,7 +71,9 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         try:
             if url.path in {"/v1/status", "/v1/health", "/health"}:
-                self._send(200, self.broker.status())
+                self._send(200, {**self.broker.status(), "router": self.daemon.router.summary()})
+            elif url.path == "/v1/router":
+                self._send(200, self.daemon.router.status())
             elif url.path == "/v1/logs":
                 limit = int(query.get("limit", ["100"])[0])
                 self._send(200, {"ok": True, "logs": self.broker.recent_logs(limit)})
@@ -125,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "config": self.daemon.saved_config(),
                                  "active": self.broker.config.to_dict(), "path": str(self.daemon.config_file)})
             else:
-                self._send(404, {"ok": False, "error": {"kind": "not_found", "code": None, "message": url.path}})
+                self._fail(404, "not_found", url.path)
         except ValueError as exc:
             self._error(BrokerError(str(exc), kind="bad_request"))
 
@@ -149,7 +105,22 @@ class Handler(BaseHTTPRequestHandler):
                                               "client": body.get("client") or "windbroker-test"}))
                 self._send(200, result)
             elif path == "/v1/config":
-                self._send(200, self.broker.update_config(body))
+                result = self.broker.update_config(body)
+                self.daemon.router.apply()  # router_* keys apply live; a no-op when unchanged
+                self._send(200, {**result, "router": self.daemon.router.status()})
+            elif path == "/v1/router/clients":
+                try:
+                    key = self.daemon.router.registry.add(body.get("name"))
+                except ValueError as exc:
+                    raise BrokerError(str(exc), kind="bad_request") from exc
+                self._send(200, {"ok": True, "name": body["name"], "key": key})
+            elif path == "/v1/router/clients/revoke":
+                name = str(body.get("name") or "")
+                try:
+                    self.daemon.router.registry.revoke(name)
+                except KeyError as exc:
+                    raise BrokerError(f"no workstation named {name!r}", kind="not_found") from exc
+                self._send(200, {"ok": True, "name": name})
             elif path in {"/v1/logs/clear", "/v1/logs/reset"}:
                 self.broker.clear_logs()
                 self._send(200, {"ok": True})
@@ -157,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "message": "shutting down"})
                 threading.Thread(target=self.daemon.stop, name="windd-shutdown", daemon=True).start()
             else:
-                self._send(404, {"ok": False, "error": {"kind": "not_found", "code": None, "message": path}})
+                self._fail(404, "not_found", path)
         except BrokerError as exc:
             self._error(exc)
         except Exception as exc:  # noqa: BLE001 - the daemon must never die on a request
@@ -165,18 +136,8 @@ class Handler(BaseHTTPRequestHandler):
             self._error(BrokerError(f"{type(exc).__name__}: {exc}", kind="internal"))
 
     def _call(self, body: dict[str, Any]) -> None:
-        method = str(body.get("method") or "")
-        usedf = bool(body.get("usedf", True))
-        result, source = self.broker.call(
-            method, untag_tree(body.get("args") or []), untag_tree(body.get("kwargs") or {}),
-            client=self._client_name(body), request_seconds=body.get("request_seconds"), usedf=usedf,
-        )
-        response: dict[str, Any] = {"ok": True, "method": method, "source": source}
-        if usedf:
-            response.update(encode_frame(result, str(body.get("frame_format") or "table")))
-        else:
-            response["windata"] = tag_tree(result)
-        self._send(200, response)
+        self._send(200, run_call(self.broker, body, client=self._client_name(body),
+                                 request_seconds=body.get("request_seconds")))
 
 
 # socketserver's default listen backlog is 5: a burst of concurrent clients
@@ -204,6 +165,7 @@ class Daemon:
         self._stopped = threading.Event()
         self.pid_file = broker_home() / "windd.pid"
         self.token = ensure_token()
+        self.router = Router(self.config, self.broker)
 
     def saved_config(self) -> dict[str, Any]:
         try:
@@ -246,6 +208,7 @@ class Daemon:
                              name=f"windd-{type(server).__name__}", daemon=True).start()
         log.info("windd %s pid %s listening on http://%s:%s and %s", __version__, os.getpid(),
                  self.config.host, self.config.port, self.config.socket_path)
+        self.router.apply()  # opt-in LAN listener; bind failures are logged, never fatal
         self.broker.start_background()
         self._stopped.wait()
 
@@ -254,6 +217,7 @@ class Daemon:
             return
         log.info("windd shutting down")
         try:
+            self.router.stop()
             self.broker.shutdown()
         finally:
             for server in self._servers:
