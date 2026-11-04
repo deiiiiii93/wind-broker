@@ -5,7 +5,9 @@ One persistent WindPy login, shared by every app, service, and notebook on this 
 On macOS, WindPy ties the login to the process that called `w.start()`. When that
 process exits, the session dies and the next start needs another QR scan.
 WindBroker moves the login into a long-lived daemon (`windd`). Everything else
-talks to the daemon over loopback HTTP or a Unix socket.
+talks to the daemon over loopback HTTP or a Unix socket. With the opt-in
+[LAN router](#4-share-with-other-workstations-lan-router), other workstations on
+your network can use the same session too.
 
 ```
  index-dashboard-codex ─┐
@@ -22,6 +24,7 @@ talks to the daemon over loopback HTTP or a Unix socket.
 | Client SDK | `src/wind_broker/client.py` (`WindClient`), `proxy.py` (`w`) |
 | CLI `windctl` | `src/wind_broker/cli.py` |
 | macOS app | `macos/Sources/*.swift`, built by `scripts/build_app.sh` |
+| LAN router (hub mode) | `src/wind_broker/router.py` |
 | Tests (mock WindPy) | `tests/` |
 
 ## 1. Install
@@ -61,7 +64,7 @@ The **menu bar icon** shows the session state.
 The popover shows uptime and request counters. It has Connect and Disconnect
 buttons, Start, Stop and Restart for the daemon, and the last five requests.
 
-The **Control Panel** has four tabs:
+The **Control Panel** has five tabs:
 
 1. **Overview & Session** shows the PIDs, state, connected-since time and counters.
    It has Login, Re-authenticate, Disconnect, the daemon controls, and the
@@ -71,6 +74,9 @@ The **Control Panel** has four tabs:
 3. **Test Console** has the WSQ live quotes, WSD daily close and TDAYS presets.
    It also has a custom runner: pick a method and enter one argument per line.
 4. **Configuration** edits `~/.wind-broker/config.json`.
+5. **Router** turns the [LAN router](#4-share-with-other-workstations-lan-router)
+   on and off and sets its port. It also adds and revokes workstation keys, and shows
+   each key once.
 
 Quitting the app leaves `windd` running, so other apps stay connected.
 
@@ -162,7 +168,102 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:18881/v1/call \
 Use `--noproxy '*'` if `http_proxy` is set in your shell. The response's `frame`
 field is `DataFrame.to_json(orient="table", date_format="iso")`.
 
-## 4. API reference
+## 4. Share with other workstations (LAN router)
+
+The Mac that runs Wind can act as a **hub**. An opt-in second listener inside
+`windd` lets other machines on your local network send Wind data requests. Those
+machines can be Macs, Windows PCs or Linux boxes, and none of them needs Wind
+installed. They all share the hub's one logged-in session.
+
+```
+ workstation A (Windows, Python)  ─┐  http://hub-mac.local:18882
+ workstation B (curl / R / Excel) ─┼─────────────────────────────►  windd router listener ─┐
+ workstation C (Mac notebook)     ─┘   Authorization: Bearer wbk_…                         │
+                                                                     local apps ──► windd ─┴─► one WindPy session
+```
+
+> **Wind entitlement.** The router shares one Wind login with other people and
+> machines. Make sure your Wind agreement allows that before you turn it on.
+> WindBroker does not check this for you.
+
+### On the hub (the Mac with Wind)
+
+```bash
+windctl router enable                 # listens on 0.0.0.0:18882, applies live, keeps the session
+windctl router add-client alice-pc    # prints the key ONCE, plus the two lines for the workstation
+windctl router status                 # addresses to use, workstations, requests, in-flight counts
+windctl router revoke alice-pc        # the key stops working on the next request
+windctl router disable                # closes the listener and hangs up open connections
+```
+
+The **Router** tab in the Control Panel does the same things.
+
+- **Off by default.** Nothing listens on the LAN until you enable the router.
+  Turning it on or off, or changing its port, never restarts `windd` or logs Wind out.
+- **One key per workstation.** Keys look like `wbk_…`. They are shown once and
+  stored only as SHA-256 digests in `~/.wind-broker/router_clients.json` (mode 0600).
+  If a key is lost, revoke it and add the workstation again.
+- **Data only.** Workstations can call `POST /v1/call` and read a trimmed
+  `GET /v1/status` (state, connected, timestamps). Everything else is local-only
+  and returns 403 over the router: login, logout, config, logs, test, shutdown,
+  and key management.
+- **The hub owner logs in.** A workstation can never start a Wind login, so no QR
+  window ever pops up because of a colleague. While the hub is logged out, remote
+  calls return 503 `not_connected`, except history-cache hits.
+- **Fair sharing.** Each workstation may have `router_max_inflight` requests
+  (default 2) in flight or queued. More get HTTP 429 `busy`. Local apps are never
+  capped. A workstation may shorten the hub's `request_seconds`, but not extend it.
+- **Live Requests** shows remote queries as `<workstation>/<app>`, for example `alice-pc/notebook`.
+
+### On a workstation
+
+Python, on any OS:
+
+```bash
+pip install "git+https://github.com/deiiiiii93/wind-broker"   # or: pip install -e <path to a copy of this repo>
+```
+
+```python
+import os
+os.environ["WIND_BROKER_URL"] = "http://192.168.1.20:18882"   # or set these in the shell
+os.environ["WIND_BROKER_KEY"] = "wbk_…"
+
+from wind_broker import w, WindClient
+w.start()                                    # reports the hub's session; never logs in
+data = w.wsd("000300.SH", "close", "2024-01-02", "2024-01-31")
+frame = WindClient().call("wss", "IF2403.CFE", "lasttrade_date")
+# or explicitly: WindClient(base_url="http://192.168.1.20:18882", api_key="wbk_…")
+```
+
+With a key set, the SDK is in **remote mode**. It talks only to the hub URL and
+never starts a local `windd`, and it never sends this machine's local token
+anywhere. Remote mode has no macOS-only dependencies. A key without a URL is a
+configuration error.
+
+Any other language uses the same JSON API as the local one, with the key as a
+bearer token:
+
+```bash
+curl -s -X POST http://192.168.1.20:18882/v1/call \
+  -H "Authorization: Bearer wbk_…" -H 'Content-Type: application/json' \
+  -d '{"method":"wsd","args":["000300.SH","close","2024-01-02","2024-01-10"],"client":"excel"}'
+```
+
+### Network notes
+
+- **Plain HTTP, trusted LAN only.** Keys and data travel unencrypted. Use the router
+  on an office or home network you trust, not on public Wi-Fi or the internet.
+  Don't forward its port on your router.
+- **Firewall.** If the macOS application firewall is on, allow incoming connections
+  for the Python that runs `windd`. Otherwise workstations time out.
+  To restrict the listener, set `router_host` to a single interface address.
+- **Errors** use the same envelope as the local API, plus `unauthorized` (401),
+  `forbidden` (403), `busy` (429 over the cap) and `not_connected` (503).
+- **Limits.** Idle connections are closed after 30 s, and at most 64 router
+  connections are open at once. Problems with the router never stop `windd`: a
+  busy port or an unreadable key file shows up as `error` in `windctl router status`.
+
+## 5. API reference
 
 | Endpoint | Purpose |
 |---|---|
@@ -175,6 +276,9 @@ field is `DataFrame.to_json(orient="table", date_format="iso")`.
 | `POST /v1/test` | `{"preset":"spot_live"\|"spot_daily"\|"tdays"}` or `{"preset":"custom","method","args"}`. Returns a preview table. |
 | `GET /v1/config`, `POST /v1/config` | Reads or persists config. The response lists `restart_required` keys. |
 | `POST /v1/shutdown` | Stops the worker with `w.stop()`, then the daemon |
+| `GET /v1/router` | LAN router state: `enabled`, `host`, `port`, `listening`, `error`, `max_inflight`, `addresses`, `clients` |
+| `POST /v1/router/clients` `{"name"}` | Issues a workstation key: `{"name","key"}`. The key is returned only this once. |
+| `POST /v1/router/clients/revoke` `{"name"}` | Revokes a workstation key (404 if unknown) |
 
 `/v1/call` options:
 
@@ -191,7 +295,7 @@ Errors return `{"ok": false, "error": {"kind", "code", "message"}}` with these s
 | `bad_request` | 400 |
 | `login` | 401 |
 | `crashed` | 502 |
-| `busy`, `sdk_missing` | 503 |
+| `busy`, `sdk_missing`, `not_connected` | 503 |
 | `timeout` | 504 |
 
 Access control:
@@ -206,11 +310,12 @@ Access control:
 - **Browser requests are blocked.** POSTs must send `Content-Type: application/json`
   and a loopback Host header, which defeats cross-site and DNS-rebinding attacks.
 - **No remote exposure through the API.** A non-loopback `host` can only be set
-  by editing `config.json` directly.
+  by editing `config.json` directly. The only supported way to serve other
+  machines is the separate, key-protected [LAN router](#4-share-with-other-workstations-lan-router).
 
 Delete the token file and restart windd to rotate it.
 
-## 5. Configuration (`~/.wind-broker/config.json`)
+## 6. Configuration (`~/.wind-broker/config.json`)
 
 | Key | Default | Applies |
 |---|---|---|
@@ -223,6 +328,10 @@ Delete the token file and restart windd to rotate it.
 | `request_seconds` | `90.0` | live |
 | `auto_connect_on_start` | `false` | next start |
 | `history_cache_dir` | `null` | live |
+| `router_enabled` | `false` | live |
+| `router_host` | `0.0.0.0` | live |
+| `router_port` | `18882` (must differ from `port`) | live |
+| `router_max_inflight` | `2` | live |
 
 `wind_module_path` takes precedence when the file exists. A `WindPy` found on
 `sys.path` is the fallback. This keeps a stray copy of `WindPy.py` in a
@@ -231,7 +340,7 @@ shadowing the configured SDK.
 
 Set `WIND_BROKER_HOME` to use another state directory. The tests do this.
 
-## 6. Session model and its trade-offs
+## 7. Session model and its trade-offs
 
 - **One login:** `w.start()` runs once per worker. Later logins are no-ops, from any number of clients.
 - **Rejected queries are harmless.** A vendor error such as `-40522012` or
@@ -250,7 +359,7 @@ Set `WIND_BROKER_HOME` to use another state directory. The tests do this.
   pull will be treated as a hang.
 - **`w.stop()` is called only** by explicit logout, Re-authenticate, or daemon shutdown.
 
-## 7. CLI
+## 8. CLI
 
 ```bash
 windctl status | start | stop | restart
@@ -260,12 +369,18 @@ windctl test [spot_live|spot_daily|tdays]
 windctl call wsd 000300.SH close 2024-01-02 2024-01-10 Fill=Blank
 windctl config request_seconds=120 history_cache_dir=~/.wind-broker/history
 windctl launchagent install|uninstall|status
+windctl router status | enable [--host H] [--port N] [--max-inflight N] | disable
+windctl router add-client NAME | revoke NAME
 ```
+
+`windctl router …` always manages this Mac's daemon, even in a shell where
+`WIND_BROKER_URL`/`WIND_BROKER_KEY` point at another hub. Other commands such as
+`windctl call` honor those variables, so they also work from a workstation.
 
 Without `pip install`, run `PYTHONPATH=src python3 -m wind_broker.cli ...`, or use
 the shims in `WindBroker.app/Contents/Resources/bin/`.
 
-## 8. Tests
+## 9. Tests
 
 ```bash
 python3 -m pytest -q
@@ -283,7 +398,10 @@ HTTP daemon and a real worker process, and cover:
 - async login, login failure, auto-connect and the history cache;
 - test presets, config persistence, the log ring buffer and the Unix socket;
 - browser-request guards, the per-user TCP token, and the `w` proxy semantics;
-- a detached auto-spawned daemon that outlives its callers.
+- a detached auto-spawned daemon that outlives its callers;
+- the LAN router: key auth and revocation, local-only admin routes, the per-workstation
+  cap, no remote logins, live enable/disable (open connections included), non-fatal bind
+  and registry errors, SDK remote mode, and a Windows-safe import (no `fcntl`).
 
 Build check:
 
@@ -301,6 +419,7 @@ Build check:
 | `~/.wind-broker/windd.pid` | Daemon PID |
 | `~/.wind-broker/wind.sock` | Unix socket |
 | `~/.wind-broker/token` | Per-user API token for TCP clients (mode 0600) |
+| `~/.wind-broker/router_clients.json` | LAN router workstation names and key digests (mode 0600) |
 | `~/.wind-broker/pycache` | Python bytecode cache, kept out of the signed app |
 | `~/Library/LaunchAgents/com.windbroker.daemon.plist` | Launch-at-login agent |
 
