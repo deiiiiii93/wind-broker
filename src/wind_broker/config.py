@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, field, fields
@@ -20,6 +21,9 @@ DEFAULT_METHODS = (
 )
 
 
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
+
+
 def broker_home() -> Path:
     """Directory holding config, socket, pid file, and logs."""
 
@@ -28,6 +32,50 @@ def broker_home() -> Path:
 
 def config_path() -> Path:
     return broker_home() / "config.json"
+
+
+def token_path() -> Path:
+    return broker_home() / "token"
+
+
+def ensure_home() -> Path:
+    """Create the state directory, private to this user when we own it."""
+
+    home = broker_home()
+    home.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(home, 0o700)
+    except OSError:
+        pass  # e.g. a shared directory we do not own; the token file is still 0600
+    return home
+
+
+def read_token() -> str | None:
+    try:
+        token = token_path().read_text().strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def ensure_token() -> str:
+    """Return the per-user API token, creating it (mode 0600) on first use.
+
+    Loopback TCP is reachable by every account on the Mac; this secret, readable
+    only by the owner, is what limits the broker to the user who runs it.
+    """
+
+    ensure_home()
+    existing = read_token()
+    if existing:
+        os.chmod(token_path(), 0o600)
+        return existing
+    token = secrets.token_urlsafe(32)
+    fd, temporary = tempfile.mkstemp(dir=broker_home(), prefix=".token.")
+    with os.fdopen(fd, "w") as handle:  # mkstemp files are created 0600
+        handle.write(token)
+    os.replace(temporary, token_path())
+    return token
 
 
 def _default_socket() -> str:

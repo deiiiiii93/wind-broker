@@ -84,9 +84,11 @@ def test_every_method_returns_exact_frames(daemon):
     assert len(tdays) == 2
 
 
-def test_table_orient_is_the_default_wire_format(daemon):
+def test_table_orient_is_the_default_wire_format(daemon, home):
+    token = (home / "token").read_text()
     request = urllib.request.Request(
-        f"{daemon.url}/v1/call", method="POST", headers={"Content-Type": "application/json", "X-Wind-Client": "curl"},
+        f"{daemon.url}/v1/call", method="POST", headers={"Content-Type": "application/json", "X-Wind-Client": "curl",
+                                                       "Authorization": f"Bearer {token}"},
         data=json.dumps({"method": "wsq", "args": ["000300.SH", "rt_last"]}).encode())
     body = json.loads(open_url(request, timeout=10).read())
     assert body["ok"] and body["frame_format"] == "table" and body["rows"] == 1
@@ -249,13 +251,15 @@ def test_unix_socket_transport(daemon, home):
     assert client.call("wsq", "000300.SH", "rt_last").shape == (1, 3)
 
 
-def test_rejects_browser_style_requests(daemon):
+def test_rejects_browser_style_requests(daemon, home):
+    # Even a caller holding the token must use JSON and a loopback Host header.
+    auth = {"Authorization": f"Bearer {(home / 'token').read_text()}"}
     request = urllib.request.Request(f"{daemon.url}/v1/shutdown", method="POST", data=b"{}",
-                                     headers={"Content-Type": "text/plain"})
+                                     headers={"Content-Type": "text/plain", **auth})
     with pytest.raises(urllib.error.HTTPError) as info:
         open_url(request, timeout=5)
     assert info.value.code == 415
-    request = urllib.request.Request(f"{daemon.url}/v1/status", headers={"Host": "evil.example:18881"})
+    request = urllib.request.Request(f"{daemon.url}/v1/status", headers={"Host": "evil.example:18881", **auth})
     with pytest.raises(urllib.error.HTTPError) as info:
         open_url(request, timeout=5)
     assert info.value.code == 403
@@ -287,3 +291,41 @@ def test_w_proxy_mimics_windpy(daemon):
     w.stop()
     assert w.isconnected()
     assert "wsd" in dir(default_w)
+
+
+def test_tcp_requires_owner_token_but_unix_socket_does_not(daemon, home):
+    import http.client
+    import os
+    import stat
+
+    from wind_broker.transport import UnixHTTPConnection
+
+    token_file = home / "token"
+    assert stat.S_IMODE(os.stat(token_file).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(home).st_mode) == 0o700
+    # Another local account can reach loopback TCP but cannot read the token.
+    for headers in ({}, {"Authorization": "Bearer wrong-token"}):
+        request = urllib.request.Request(f"{daemon.url}/v1/status", headers=headers)
+        with pytest.raises(urllib.error.HTTPError) as info:
+            open_url(request, timeout=5)
+        assert info.value.code == 401
+    hostile = urllib.request.Request(
+        f"{daemon.url}/v1/config", method="POST", data=json.dumps({"wind_module_path": "/tmp/evil.py"}).encode(),
+        headers={"Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as info:
+        open_url(hostile, timeout=5)
+    assert info.value.code == 401
+    assert json.loads((home / "config.json").read_text())["wind_module_path"].endswith("fake_windpy.py")
+    # With the token it works; the 0600 Unix socket needs none.
+    ok = urllib.request.Request(f"{daemon.url}/v1/status",
+                                headers={"Authorization": f"Bearer {token_file.read_text()}"})
+    assert json.loads(open_url(ok, timeout=5).read())["ok"]
+    connection = UnixHTTPConnection(str(home / "wind.sock"), timeout=5)
+    connection.request("GET", "/v1/status")
+    assert connection.getresponse().status == 200
+    connection.close()
+
+
+def test_api_cannot_expose_daemon_to_network(daemon):
+    with pytest.raises(ProviderError, match="non-loopback"):
+        daemon.client().set_config(host="0.0.0.0")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -19,11 +20,10 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .broker import Broker, BrokerError
 from .codec import encode_frame, tag_tree, untag_tree
-from .config import broker_home, config_path, load_config
+from .config import LOOPBACK_HOSTS, broker_home, config_path, ensure_home, ensure_token, load_config
 
 log = logging.getLogger("windd")
 MAX_BODY = 8 * 1024 * 1024
-LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", ""}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -69,6 +69,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(403, {"ok": False, "error": {"kind": "forbidden", "code": None,
                                                         "message": f"Host {host!r} not allowed"}})
                 return False
+            # Every local account can reach loopback TCP, so TCP callers must
+            # prove they can read the owner-only token file. The Unix socket
+            # (mode 0600 in a 0700 directory) is already owner-only.
+            if not self._token_ok():
+                self._send(401, {"ok": False, "error": {"kind": "unauthorized", "code": None,
+                                                        "message": "missing or invalid token; send "
+                                                                   "'Authorization: Bearer <~/.wind-broker/token>'"}})
+                return False
         if self.command == "POST":
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if ctype != "application/json":
@@ -76,6 +84,11 @@ class Handler(BaseHTTPRequestHandler):
                                                         "message": "POST requires Content-Type: application/json"}})
                 return False
         return True
+
+    def _token_ok(self) -> bool:
+        header = self.headers.get("Authorization") or ""
+        supplied = header[7:].strip() if header[:7].lower() == "bearer " else (self.headers.get("X-Wind-Token") or "")
+        return hmac.compare_digest(supplied.encode(), self.daemon.token.encode())
 
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
@@ -190,6 +203,7 @@ class Daemon:
         self._servers: list[socketserver.BaseServer] = []
         self._stopped = threading.Event()
         self.pid_file = broker_home() / "windd.pid"
+        self.token = ensure_token()
 
     def saved_config(self) -> dict[str, Any]:
         try:
@@ -225,8 +239,7 @@ class Daemon:
 
     def serve(self) -> None:
         self.bind()
-        home = broker_home()
-        home.mkdir(parents=True, exist_ok=True)
+        ensure_home()
         self.pid_file.write_text(str(os.getpid()))
         for server in self._servers:
             threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25},

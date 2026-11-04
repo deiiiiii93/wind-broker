@@ -145,7 +145,23 @@ final class BrokerAPI: @unchecked Sendable {
         session = URLSession(configuration: configuration)
     }
 
-    private func send<T: Decodable>(_ request: URLRequest) async throws -> T {
+    /// Per-user secret written by windd (mode 0600). Loopback TCP is reachable by
+    /// every account on the Mac, so the daemon requires it on every TCP request.
+    private static func token() -> String? {
+        let home = ProcessInfo.processInfo.environment["WIND_BROKER_HOME"]
+            .map { NSString(string: $0).expandingTildeInPath }
+            ?? (NSHomeDirectory() as NSString).appendingPathComponent(".wind-broker")
+        let path = (home as NSString).appendingPathComponent("token")
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        let token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    private func send<T: Decodable>(_ original: URLRequest) async throws -> T {
+        var request = original
+        if let token = BrokerAPI.token() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         let data: Data
         let response: URLResponse
         do {

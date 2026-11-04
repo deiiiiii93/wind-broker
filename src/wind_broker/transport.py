@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import __version__
-from .config import BrokerConfig, broker_home, load_config
+from .config import BrokerConfig, broker_home, load_config, read_token
 from .errors import DaemonUnavailable, ProviderError
 
 
@@ -67,6 +67,9 @@ class Transport:
                    "Accept": "application/json"}
         if payload is not None:
             headers["Content-Type"] = "application/json"
+        token = read_token()  # re-read: a freshly spawned daemon may have just created it
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         last_error: Exception | None = None
         for connection in self._connections(timeout):
             try:

@@ -143,10 +143,19 @@ The proxy supports `wsd`, `wss`, `wsq`, `wsi`, `wset`, `tdays`, `tdaysoffset`,
 
 ### Any language: HTTP
 
+Over the Unix socket, no token is needed:
+
 ```bash
-curl -s --noproxy '*' http://127.0.0.1:18881/v1/status
+curl -s --unix-socket ~/.wind-broker/wind.sock http://localhost/v1/status
+```
+
+Over TCP, send the per-user token from `~/.wind-broker/token`:
+
+```bash
+TOKEN=$(cat ~/.wind-broker/token)
+curl -s --noproxy '*' -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18881/v1/status
 curl -s --noproxy '*' -X POST http://127.0.0.1:18881/v1/call \
-  -H 'Content-Type: application/json' -H 'X-Wind-Client: my-app' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -H 'X-Wind-Client: my-app' \
   -d '{"method":"wsd","args":["000300.SH","close","2024-01-02","2024-01-10","Fill=Blank"]}'
 ```
 
@@ -185,9 +194,21 @@ Errors return `{"ok": false, "error": {"kind", "code", "message"}}` with these s
 | `busy`, `sdk_missing` | 503 |
 | `timeout` | 504 |
 
-POSTs must send `Content-Type: application/json`, and the Host header must be
-loopback. This blocks browser cross-site requests and DNS-rebinding attacks.
-The Unix socket is mode 0600.
+Access control:
+
+- **TCP needs the token.** Every account on a Mac can reach `127.0.0.1`. So each
+  TCP request must send `Authorization: Bearer <token>`. The daemon creates the
+  token on first start in `~/.wind-broker/token`, readable only by you. Without
+  it, other local users could read your Wind data or change the SDK path to run
+  their code as you. The Python SDK and the app send the token automatically.
+- **The Unix socket needs no token.** It is mode 0600 inside the 0700
+  `~/.wind-broker` directory, so only you can connect.
+- **Browser requests are blocked.** POSTs must send `Content-Type: application/json`
+  and a loopback Host header, which defeats cross-site and DNS-rebinding attacks.
+- **No remote exposure through the API.** A non-loopback `host` can only be set
+  by editing `config.json` directly.
+
+Delete the token file and restart windd to rotate it.
 
 ## 5. Configuration (`~/.wind-broker/config.json`)
 
@@ -260,7 +281,7 @@ HTTP daemon and a real worker process, and cover:
 - a status call that does not block behind a slow query;
 - async login, login failure, auto-connect and the history cache;
 - test presets, config persistence, the log ring buffer and the Unix socket;
-- browser-request guards and the `w` proxy semantics;
+- browser-request guards, the per-user TCP token, and the `w` proxy semantics;
 - a detached auto-spawned daemon that outlives its callers.
 
 Build check:
@@ -278,4 +299,6 @@ Build check:
 | `~/.wind-broker/windd.log` | Daemon output, plus WindPy's banner |
 | `~/.wind-broker/windd.pid` | Daemon PID |
 | `~/.wind-broker/wind.sock` | Unix socket |
+| `~/.wind-broker/token` | Per-user API token for TCP clients (mode 0600) |
+| `~/.wind-broker/pycache` | Python bytecode cache, kept out of the signed app |
 | `~/Library/LaunchAgents/com.windbroker.daemon.plist` | Launch-at-login agent |
