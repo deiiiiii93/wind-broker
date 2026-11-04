@@ -78,6 +78,10 @@ def ensure_token() -> str:
     return token
 
 
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _default_socket() -> str:
     return str(broker_home() / "wind.sock")
 
@@ -93,6 +97,12 @@ class BrokerConfig:
     request_seconds: float = 90.0
     auto_connect_on_start: bool = False
     history_cache_dir: str | None = None
+    # LAN router (hub mode): an opt-in second listener for other workstations.
+    # Applied live by the daemon, so these are not restart keys.
+    router_enabled: bool = False
+    router_host: str = "0.0.0.0"
+    router_port: int = 18882
+    router_max_inflight: int = 2
 
     # Keys that only take effect after the daemon restarts (listeners/worker).
     RESTART_KEYS = frozenset({"host", "port", "unix_socket_path", "wind_module_path", "python_executable"})
@@ -100,7 +110,7 @@ class BrokerConfig:
     def validate(self) -> None:
         if not isinstance(self.host, str) or not self.host:
             raise ValueError("host must be a non-empty string")
-        if not isinstance(self.port, int) or isinstance(self.port, bool) or not 0 <= self.port <= 65535:
+        if not _is_int(self.port) or not 0 <= self.port <= 65535:
             raise ValueError("port must be an integer in 0..65535")
         if not isinstance(self.startup_seconds, (int, float)) or self.startup_seconds <= 0:
             raise ValueError("startup_seconds must be positive")
@@ -113,6 +123,16 @@ class BrokerConfig:
                 raise ValueError(f"{name} must be a string")
         if self.history_cache_dir is not None and not isinstance(self.history_cache_dir, str):
             raise ValueError("history_cache_dir must be a string or null")
+        if not isinstance(self.router_enabled, bool):
+            raise ValueError("router_enabled must be a boolean")
+        if not isinstance(self.router_host, str) or not self.router_host:
+            raise ValueError("router_host must be a non-empty string")
+        if not _is_int(self.router_port) or not 0 <= self.router_port <= 65535:
+            raise ValueError("router_port must be an integer in 0..65535")
+        if self.router_port and self.router_port == self.port:
+            raise ValueError("router_port must differ from port")
+        if not _is_int(self.router_max_inflight) or self.router_max_inflight < 1:
+            raise ValueError("router_max_inflight must be an integer >= 1")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
