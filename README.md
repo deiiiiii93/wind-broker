@@ -225,8 +225,9 @@ Delete the token file and restart windd to rotate it.
 | `history_cache_dir` | `null` | live |
 
 `wind_module_path` takes precedence when the file exists. A `WindPy` found on
-`sys.path` is the fallback. This matters on this Mac: a copy in
-`~/.local/lib/python3.11/site-packages` would otherwise shadow the configured SDK.
+`sys.path` is the fallback. This keeps a stray copy of `WindPy.py` in a
+site-packages directory, such as `~/.local/lib/python3.x/site-packages`, from
+shadowing the configured SDK.
 
 Set `WIND_BROKER_HOME` to use another state directory. The tests do this.
 
@@ -302,3 +303,12 @@ Build check:
 | `~/.wind-broker/token` | Per-user API token for TCP clients (mode 0600) |
 | `~/.wind-broker/pycache` | Python bytecode cache, kept out of the signed app |
 | `~/Library/LaunchAgents/com.windbroker.daemon.plist` | Launch-at-login agent |
+
+## License
+
+WindBroker is released under the [MIT License](LICENSE).
+
+WindPy, `libWind.QuantData.dylib`, and Wind data are proprietary to Wind
+Information Co., Ltd. and are not included or covered by this license. Using
+WindBroker requires your own Wind terminal installation and API entitlement,
+and your use of Wind data remains subject to your Wind agreement.
