@@ -1,6 +1,14 @@
+<p align="center">
+  <img src="docs/images/wombat-icon-256.png" width="128" alt="WindBroker app icon: a wombat in an orange scarf sitting in the wind">
+</p>
+
 # WindBroker for macOS
 
 One persistent WindPy login, shared by every app, service, and notebook on this Mac.
+
+WindBroker's mascot is a wombat (**Wom·Bat**, the same W·B as **W**ind**B**roker).
+It sits calmly in the wind and holds your session. You'll see it in the menu bar
+and as the app icon.
 
 On macOS, WindPy ties the login to the process that called `w.start()`. When that
 process exits, the session dies and the next start needs another QR scan.
@@ -24,6 +32,8 @@ your network can use the same session too.
 | Client SDK | `src/wind_broker/client.py` (`WindClient`), `proxy.py` (`w`) |
 | CLI `windctl` | `src/wind_broker/cli.py` |
 | macOS app | `macos/Sources/*.swift`, built by `scripts/build_app.sh` |
+| Menu bar wombat | `macos/Sources/StatusIcon.swift` (drawn in code, one face per state) |
+| App icon | `macos/Assets/AppIcon-1024.png`; `scripts/make_app_icon.sh` regenerates every size |
 | LAN router (hub mode) | `src/wind_broker/router.py` |
 | Tests (mock WindPy) | `tests/` |
 
@@ -52,14 +62,19 @@ cd ~/index-dashboard-codex && uv pip install -e ~/wind-broker
 
 ## 2. Use the app
 
-The **menu bar icon** shows the session state.
+The **menu bar wombat** shows the session state twice: its face changes, and so does
+the dot in its corner. The wombat follows the menu bar's color (black on a light
+menu bar, white on a dark one); the dot keeps its color.
 
-| Color | Meaning |
-|---|---|
-| Green | Connected |
-| Amber | Connecting, waiting for the QR scan |
-| Gray | Disconnected, or the daemon is stopped (outline icon) |
-| Red | Error |
+![Menu bar wombat in each state, on light and dark menu bars](docs/images/menubar-states.png)
+
+| Face | Dot | Meaning |
+|---|---|---|
+| Awake | Green | Connected |
+| Glancing up | Amber, pulsing | Connecting, waiting for the QR scan |
+| Meh | Gray | Disconnected |
+| Asleep, dimmed | Hollow ring | The daemon is stopped |
+| X-eyes | Red | Error |
 
 The popover shows uptime and request counters. It has Connect and Disconnect
 buttons, Start, Stop and Restart for the daemon, and the last five requests.
@@ -409,6 +424,10 @@ Build check:
 ./scripts/build_app.sh && file dist/WindBroker.app/Contents/MacOS/WindBroker
 # -> Mach-O 64-bit executable arm64
 ```
+
+To change the app icon, replace `macos/Assets/AppIcon-1024.png` (a rounded square
+about 824 px wide, centered on a transparent 1024 px canvas), then run
+`./scripts/make_app_icon.sh` to rebuild the asset-catalog sizes and `AppIcon.icns`.
 
 ## Files and logs
 
