@@ -363,6 +363,32 @@ def test_rejected_post_closes_the_connection(hub):
         connection.close()
 
 
+def test_partial_router_post_keeps_pending_restart_keys(daemon):
+    client = daemon.client()
+    pending = client.set_config(wind_module_path="/opt/other/WindPy.py")
+    assert pending["restart_required"] == ["wind_module_path"]
+    client.set_config(router_max_inflight=3)  # a partial save, like the Router tab or windctl router
+    saved = json.loads(daemon.daemon.config_file.read_text())
+    assert saved["wind_module_path"] == "/opt/other/WindPy.py" and saved["router_max_inflight"] == 3
+
+
+def test_oversized_or_bad_content_length_closes_the_connection(hub):
+    running = hub()
+    key = add_client(running, "quinn")
+    for length in ("99999999999", "-1", "abc"):
+        connection = socket.create_connection(("127.0.0.1", running.daemon.router.port), timeout=10)
+        try:
+            connection.sendall((f"POST /v1/call HTTP/1.1\r\nHost: hub\r\nAuthorization: Bearer {key}\r\n"
+                                f"Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n{{}}").encode())
+            response = b""
+            while chunk := connection.recv(65536):
+                response += chunk
+            head = response.split(b"\r\n\r\n", 1)[0].decode()
+            assert head.startswith("HTTP/1.1 400") and "Connection: close" in head, (length, head)
+        finally:
+            connection.close()
+
+
 def test_router_port_in_use_is_not_fatal(make_daemon):
     blocker = socket.socket()
     blocker.bind(("127.0.0.1", 0))

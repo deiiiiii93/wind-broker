@@ -267,7 +267,8 @@ final class BrokerStore: ObservableObject {
     // MARK: LAN router
 
     func refreshRouter() async {
-        if let info: RouterInfo = try? await api.get("v1/router") { routerInfo = info }
+        // Clear on failure so a stopped daemon never shows a stale "Listening".
+        routerInfo = try? await api.get("v1/router") as RouterInfo
     }
 
     /// Apply a router config response without marking the Configuration tab as edited.

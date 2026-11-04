@@ -491,7 +491,7 @@ struct RouterTab: View {
                                 .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty || !store.daemonRunning || store.busyAction != nil)
                             Spacer()
                         }
-                        Text("Names: letters, digits, dot, dash, underscore (max 40). Each workstation gets its own key; revoke it here to cut it off immediately.")
+                        Text("Names: letters, digits, dot, dash, underscore (max 40). Each workstation gets its own key; revoke it here and it stops working on its next request.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     .padding(6)
@@ -520,7 +520,7 @@ struct RouterTab: View {
                 revoking = nil
             }
         } message: {
-            Text("The workstation's key stops working immediately and its open connections are closed.")
+            Text("The workstation's key stops working on its next request. Calls already running finish.")
         }
         .sheet(item: $store.newRouterKey) { created in
             NewKeySheet(created: created, url: routerURL(info?.addresses.first ?? info?.hostname ?? "<hub-address>", port: shownPort))

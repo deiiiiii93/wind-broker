@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 from . import __version__
 from .codec import decode_exact, encode_exact, plain_args, preview
-from .config import DEFAULT_METHODS, LOOPBACK_HOSTS, BrokerConfig, save_config
+from .config import DEFAULT_METHODS, LOOPBACK_HOSTS, BrokerConfig, config_path, load_config, save_config
 from .worker import worker_main
 
 log = logging.getLogger("windd")
@@ -502,6 +502,15 @@ class Broker:
                 "latency_ms": round((time.monotonic() - started) * 1000, 1), "preview": preview(frame)}
 
     # ---------------------------------------------------------------- config
+    def _saved_config(self) -> BrokerConfig:
+        path = self.config_file or config_path()
+        if not path.exists():
+            return self.config
+        try:
+            return load_config(path)
+        except (OSError, ValueError):
+            return self.config
+
     def update_config(self, changes: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(changes, dict):
             raise BrokerError("config body must be an object", kind="bad_request")
@@ -509,11 +518,19 @@ class Broker:
             raise BrokerError("a non-loopback host can only be set by editing config.json directly",
                               kind="bad_request")
         try:
-            candidate = self.config.updated(changes)
+            # Merge into the *saved* config: the live one still holds the old
+            # values of restart keys, and a partial save (Router tab, windctl
+            # router) must not silently revert a change waiting for a restart.
+            candidate = self._saved_config().updated(changes)
         except (TypeError, ValueError) as exc:
             raise BrokerError(str(exc), kind="bad_request") from exc
+        if candidate.router_port and candidate.router_port == self.config.port:
+            raise BrokerError("router_port must differ from the port windd is listening on", kind="bad_request")
+        # Port 0 asks for any free port, which the running listener (whose
+        # resolved port is in the live config) already satisfies.
         restart = sorted(k for k in BrokerConfig.RESTART_KEYS
-                         if getattr(candidate, k) != getattr(self.config, k))
+                         if getattr(candidate, k) != getattr(self.config, k)
+                         and not (k == "port" and candidate.port == 0))
         save_config(candidate, self.config_file)
         # Timeouts, cache dir and auto-connect apply live; listener and SDK
         # paths are kept until restart so the running session is untouched.

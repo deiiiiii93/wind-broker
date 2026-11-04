@@ -212,7 +212,8 @@ def _router(client: WindClient, options: argparse.Namespace) -> int:
         if options.json:
             _print({**issued, "port": info["port"], "addresses": info["addresses"]}, True)
             return 0
-        host = (info.get("addresses") or [f"{info.get('hostname', 'this-mac')}.local"])[0]
+        hostname = str(info.get("hostname") or "this-mac")
+        host = (info.get("addresses") or [hostname if hostname.endswith(".local") else f"{hostname}.local"])[0]
         print(f"Key for {issued['name']} (shown once, store it now):\n\n  {issued['key']}\n")
         print("On the workstation:")
         print(f"  WIND_BROKER_URL=http://{host}:{info['port']}")

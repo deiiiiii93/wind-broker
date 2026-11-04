@@ -59,9 +59,14 @@ class JSONHandler(BaseHTTPRequestHandler):
         return header[7:].strip() if header[:7].lower() == "bearer " else (self.headers.get("X-Wind-Token") or "")
 
     def _body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_BODY:
-            raise BrokerError("request body too large", kind="bad_request")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= MAX_BODY:
+            self.close_connection = True  # the body stays unread: never parse it as the next request
+            raise BrokerError("request body too large" if length > MAX_BODY else "invalid Content-Length",
+                              kind="bad_request")
         raw = self.rfile.read(length) if length else b""
         if not raw.strip():
             return {}
