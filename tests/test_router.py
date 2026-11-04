@@ -552,6 +552,44 @@ def test_sdk_imports_without_fcntl():
     assert result.returncode == 0, result.stderr
 
 
+# ------------------------------------------------------------------- CLI
+def test_windctl_router_commands(daemon, capsys, monkeypatch):
+    import re
+
+    from wind_broker import cli
+
+    # A workstation-style environment must not redirect hub management commands.
+    monkeypatch.setenv("WIND_BROKER_KEY", "wbk_elsewhere")
+    monkeypatch.setenv("WIND_BROKER_URL", "http://192.0.2.1:18882")
+
+    assert cli.main(["router", "enable", "--host", "127.0.0.1", "--port", "0", "--max-inflight", "3"]) == 0
+    captured = capsys.readouterr()
+    assert "Wind agreement" in captured.err
+    assert daemon.daemon.router.listening and daemon.daemon.config.router_max_inflight == 3
+
+    assert cli.main(["router", "add-client", "paul"]) == 0
+    out = capsys.readouterr().out
+    key = re.search(r"wbk_[A-Za-z0-9_-]+", out).group(0)
+    assert f"WIND_BROKER_KEY={key}" in out and "WIND_BROKER_URL=http://" in out
+    monkeypatch.delenv("WIND_BROKER_KEY", raising=False)
+    monkeypatch.delenv("WIND_BROKER_URL", raising=False)
+    assert http(router_url(daemon), "/v1/status", key=key)[0] == 200
+    monkeypatch.setenv("WIND_BROKER_KEY", "wbk_elsewhere")
+
+    assert cli.main(["--json", "router", "status"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["listening"] is True and [c["name"] for c in status["clients"]] == ["paul"]
+
+    assert cli.main(["router", "revoke", "paul"]) == 0
+    assert cli.main(["router", "revoke", "nobody"]) == 2
+    capsys.readouterr()
+    monkeypatch.delenv("WIND_BROKER_KEY", raising=False)
+    assert http(router_url(daemon), "/v1/status", key=key)[0] == 401
+
+    assert cli.main(["router", "disable"]) == 0
+    assert not daemon.daemon.router.listening
+
+
 def test_router_keys_survive_daemon_restart(make_daemon):
     first = make_daemon(router_enabled=True, router_host="127.0.0.1", router_port=0)
     assert router_settled(first)

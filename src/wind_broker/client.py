@@ -160,6 +160,18 @@ class WindClient:
     def set_config(self, **changes: Any) -> dict[str, Any]:
         return self._request("POST", "/v1/config", changes)
 
+    # ------------------------------------------------------- LAN router (hub)
+    def router_status(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/router")
+
+    def router_add_client(self, name: str) -> dict[str, Any]:
+        """Issue a workstation key. The key is in the response once and never again."""
+
+        return self._request("POST", "/v1/router/clients", {"name": name})
+
+    def router_revoke(self, name: str) -> dict[str, Any]:
+        return self._request("POST", "/v1/router/clients/revoke", {"name": name})
+
     def shutdown_daemon(self) -> dict[str, Any]:
         return self._request("POST", "/v1/shutdown", timeout=30)
 

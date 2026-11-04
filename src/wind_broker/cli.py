@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from typing import Any
@@ -66,8 +67,25 @@ def main(argv: list[str] | None = None) -> int:
     agent = sub.add_parser("launchagent", help="manage launch-at-login")
     agent.add_argument("action", choices=["install", "uninstall", "status"])
     agent.add_argument("--stop", action="store_true", help="with uninstall: also stop the running daemon")
+    router = sub.add_parser("router", help="LAN hub: share this Mac's Wind session with other workstations")
+    router_sub = router.add_subparsers(dest="router_command", required=True)
+    router_sub.add_parser("status", help="listener state, addresses and workstations")
+    enable = router_sub.add_parser("enable", help="start the LAN listener (applies live)")
+    enable.add_argument("--host", help="bind address (default 0.0.0.0 = all interfaces)")
+    enable.add_argument("--port", type=int, help="TCP port (default 18882)")
+    enable.add_argument("--max-inflight", type=int, help="per-workstation concurrent request cap (default 2)")
+    router_sub.add_parser("disable", help="stop the LAN listener and hang up open connections")
+    add_client = router_sub.add_parser("add-client", help="issue a key for a workstation (shown once)")
+    add_client.add_argument("name")
+    revoke = router_sub.add_parser("revoke", help="revoke a workstation's key")
+    revoke.add_argument("name")
     options = parser.parse_args(argv)
 
+    if options.command == "router":
+        # Hub management always targets this Mac's daemon, even in a shell that
+        # is set up as a workstation (WIND_BROKER_KEY/URL point at another hub).
+        os.environ.pop("WIND_BROKER_KEY", None)
+        os.environ.pop("WIND_BROKER_URL", None)
     client = WindClient(client_name="windctl", autospawn=options.command in {"start", "login", "test", "call"})
     try:
         if options.command == "status":
@@ -130,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
                 _print(client.set_config(**changes), options.json)
             else:
                 _print(client.get_config()["config"], options.json)
+        elif options.command == "router":
+            return _router(client, options)
         elif options.command == "launchagent":
             if options.action == "install":
                 _print(launchagent.install(), options.json)
@@ -143,6 +163,64 @@ def main(argv: list[str] | None = None) -> int:
     except ProviderError as exc:
         print(f"windctl: {exc}", file=sys.stderr)
         return 2
+    return 0
+
+
+ENTITLEMENT_WARNING = ("windctl: the LAN router shares this Mac's Wind login with other workstations. "
+                       "Make sure your Wind agreement allows it.")
+
+
+def _router(client: WindClient, options: argparse.Namespace) -> int:
+    command = options.router_command
+    if command == "status":
+        info = client.router_status()
+        if options.json:
+            _print(info, True)
+            return 0
+        state = "listening" if info["listening"] else ("enabled, NOT listening" if info["enabled"] else "disabled")
+        print(f"router: {state} on {info['host']}:{info['port']}  (cap {info['max_inflight']} per workstation)")
+        if info.get("error"):
+            print(f" error: {info['error']}")
+        if info.get("addresses"):
+            print(" reach: " + ", ".join(f"http://{a}:{info['port']}" for a in info["addresses"]))
+        for c in info["clients"]:
+            print(f"  {c['name']:<20} requests {c['requests']:>6}  inflight {c['inflight']}  "
+                  f"last {c['last_seen_at'] or '-'} from {c['last_addr'] or '-'}")
+        if not info["clients"]:
+            print("  (no workstations; add one with: windctl router add-client NAME)")
+    elif command == "enable":
+        changes: dict[str, Any] = {"router_enabled": True}
+        for option, key in (("host", "router_host"), ("port", "router_port"),
+                            ("max_inflight", "router_max_inflight")):
+            if getattr(options, option) is not None:
+                changes[key] = getattr(options, option)
+        print(ENTITLEMENT_WARNING, file=sys.stderr)
+        info = client.set_config(**changes)["router"]
+        if options.json:
+            _print(info, True)
+        elif info["listening"]:
+            print(f"router listening on {info['host']}:{info['port']}")
+        else:
+            print(f"router enabled but not listening: {info.get('error')}")
+        return 0 if info["listening"] else 1
+    elif command == "disable":
+        info = client.set_config(router_enabled=False)["router"]
+        _print(info, True) if options.json else print("router disabled")
+    elif command == "add-client":
+        issued = client.router_add_client(options.name)
+        info = client.router_status()
+        if options.json:
+            _print({**issued, "port": info["port"], "addresses": info["addresses"]}, True)
+            return 0
+        host = (info.get("addresses") or [f"{info.get('hostname', 'this-mac')}.local"])[0]
+        print(f"Key for {issued['name']} (shown once, store it now):\n\n  {issued['key']}\n")
+        print("On the workstation:")
+        print(f"  WIND_BROKER_URL=http://{host}:{info['port']}")
+        print(f"  WIND_BROKER_KEY={issued['key']}")
+        if not info["listening"]:
+            print("\nThe router is not listening yet: windctl router enable")
+    elif command == "revoke":
+        _print(client.router_revoke(options.name), options.json)
     return 0
 
 
