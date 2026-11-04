@@ -22,6 +22,7 @@ def home(monkeypatch):
     monkeypatch.setenv("PYTHONNOUSERSITE", "1")  # never let ~/.local WindPy leak into tests
     monkeypatch.delenv("WIND_BROKER_URL", raising=False)
     monkeypatch.delenv("WIND_BROKER_SOCKET", raising=False)
+    monkeypatch.delenv("WIND_BROKER_KEY", raising=False)
     yield directory
     shutil.rmtree(directory, ignore_errors=True)
 

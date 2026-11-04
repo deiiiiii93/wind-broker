@@ -389,6 +389,129 @@ def test_router_closes_idle_unauthenticated_connections(hub, monkeypatch):
         connection.close()
 
 
+# ------------------------------------------------------- SDK remote mode
+def remote_client(running, key: str, **kwargs):
+    from wind_broker import WindClient
+
+    return WindClient(base_url=router_url(running), api_key=key, startup_seconds=5, request_seconds=2, **kwargs)
+
+
+def test_sdk_remote_mode_against_router(hub, monkeypatch):
+    import wind_broker.client as client_module
+    import wind_broker.transport as transport_module
+    from wind_broker.proxy import WindProxy
+
+    running = hub()
+    key = add_client(running, "lena")
+    running.client().login()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("remote mode must not touch the local token or spawn windd")
+
+    monkeypatch.setattr(transport_module, "read_token", forbidden)
+    monkeypatch.setattr(client_module, "spawn_daemon", forbidden)
+    client = remote_client(running, key, client_name="research")
+    assert client.remote and client.autospawn is False
+    frame = client.call("wsd", *WSD_ARGS)
+    assert frame["CLOSE"].tolist() == [3431.1, 3400.5]
+    assert client.windata("wsd", *WSD_ARGS)["ErrorCode"] == 0
+    proxy = WindProxy(client)
+    assert proxy.start().ErrorCode == 0 and proxy.isconnected()
+    assert proxy.wsd(*WSD_ARGS).ErrorCode == 0
+    error, df = proxy.wsd(*WSD_ARGS, usedf=True)
+    assert error == 0 and df.shape == (2, 1)
+    with pytest.raises(ProviderError) as caught:
+        client.logout()  # admin routes stay local
+    assert caught.value.kind == "forbidden"
+    # Local API calls would read the (patched) token: inspect the broker directly.
+    assert "lena/research" in [e["client"] for e in running.broker.recent_logs(20)]
+    assert running.broker.status()["login_count"] == 1
+
+
+def test_sdk_remote_mode_from_environment(hub, monkeypatch):
+    from wind_broker import WindClient
+
+    running = hub()
+    key = add_client(running, "mike")
+    running.client().login()
+    monkeypatch.setenv("WIND_BROKER_URL", router_url(running))
+    monkeypatch.setenv("WIND_BROKER_KEY", key)
+    client = WindClient(startup_seconds=5, request_seconds=2)
+    assert client.remote
+    assert client.call("wsd", *WSD_ARGS).shape == (2, 1)
+
+
+def test_sdk_remote_start_reports_hub_logged_out(hub, home):
+    from wind_broker.proxy import WindProxy
+
+    running = hub()
+    key = add_client(running, "nina")
+    result = WindProxy(remote_client(running, key)).start()
+    assert result.ErrorCode != 0 and "not logged in" in str(result.Data)
+    assert events(home).count("start") == 0
+
+
+def test_sdk_remote_mode_never_autospawns(home, monkeypatch):
+    import wind_broker.client as client_module
+    from wind_broker import DaemonUnavailable, WindClient
+
+    monkeypatch.setattr(client_module, "spawn_daemon", lambda **_: pytest.fail("autospawn in remote mode"))
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()
+    client = WindClient(base_url=f"http://127.0.0.1:{port}", api_key="wbk_x", autospawn=True)
+    with pytest.raises(DaemonUnavailable):
+        client.status()
+
+
+def test_sdk_key_without_url_is_a_configuration_error(home, monkeypatch):
+    from wind_broker import WindClient
+
+    with pytest.raises(ValueError, match="hub URL"):
+        WindClient(api_key="wbk_x")
+    monkeypatch.setenv("WIND_BROKER_KEY", "wbk_x")
+    with pytest.raises(ValueError, match="hub URL"):
+        WindClient()
+
+
+def test_local_token_is_only_sent_to_local_targets(home):
+    from wind_broker.config import ensure_token
+    from wind_broker.transport import Transport
+
+    token = ensure_token()
+    assert Transport(base_url="http://192.168.1.50:18882")._auth_token(unix=False) is None
+    assert Transport(base_url="http://hub-mac.local:18882")._auth_token(unix=False) is None
+    assert Transport(base_url="http://127.0.0.1:18881")._auth_token(unix=False) == token
+    assert Transport(base_url="http://localhost:18881")._auth_token(unix=False) == token
+    assert Transport(base_url="http://192.168.1.50:18882")._auth_token(unix=True) == token
+    assert Transport(base_url="http://192.168.1.50:18882", api_key="wbk_k")._auth_token(unix=False) == "wbk_k"
+
+
+def test_daemon_command_drops_remote_settings(home, monkeypatch):
+    from wind_broker.transport import daemon_command
+
+    monkeypatch.setenv("WIND_BROKER_KEY", "wbk_x")
+    monkeypatch.setenv("WIND_BROKER_URL", "http://hub:18882")
+    _, env = daemon_command()
+    assert "WIND_BROKER_KEY" not in env and "WIND_BROKER_URL" not in env
+
+
+def test_sdk_imports_without_fcntl():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src"
+    code = ("import sys; sys.modules['fcntl'] = None\n"
+            "import wind_broker, wind_broker_client\n"
+            "from wind_broker import WindClient, w\n"
+            "WindClient(base_url='http://192.168.1.50:18882', api_key='wbk_x')\n")
+    result = subprocess.run([sys.executable, "-c", code], env={**os.environ, "PYTHONPATH": str(src)},
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+
 def test_router_keys_survive_daemon_restart(make_daemon):
     first = make_daemon(router_enabled=True, router_host="127.0.0.1", router_port=0)
     assert router_settled(first)

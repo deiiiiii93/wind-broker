@@ -56,6 +56,13 @@ class WindProxy:
     # -------------------------------------------------------------- session
     def start(self, options: Any = None, waitTime: int = 120, *args: Any, **kwargs: Any) -> WindData:  # noqa: N803
         try:
+            if self.client.remote:
+                # Workstations cannot log the hub in; report the hub's session instead.
+                status = self.client.status()
+                if not status.get("connected"):
+                    return WindData(ErrorCode=GENERIC_CODE,
+                                    Data=["the hub's Wind session is not logged in; log in on the hub"])
+                return WindData(ErrorCode=0, Data=["OK!"])
             status = self.client.login(wait=True, wait_seconds=max(int(waitTime), 1))
         except ProviderError as exc:
             return WindData(ErrorCode=exc.code or GENERIC_CODE, Data=[str(exc)])

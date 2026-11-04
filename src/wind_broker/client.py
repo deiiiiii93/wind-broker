@@ -32,7 +32,9 @@ def default_client_name() -> str:
 
 
 class WindClient:
-    """Thread-safe (stateless) client for the local Wind broker.
+    """Thread-safe (stateless) client for the local Wind broker, or, with a
+    workstation key (``api_key=`` / ``WIND_BROKER_KEY``) and a hub URL
+    (``base_url=`` / ``WIND_BROKER_URL``), for another Mac's LAN router.
 
     ``error_class`` lets a host application receive its own exception type,
     e.g. ``WindClient(error_class=app.providers.base.ProviderError)``.
@@ -43,7 +45,8 @@ class WindClient:
     def __init__(self, *, module_path: str = DEFAULT_WIND_MODULE, startup_seconds: int = 300,
                  request_seconds: float = 90, history_cache_dir: str | None = None,
                  base_url: str | None = None, socket_path: str | None = None, client_name: str | None = None,
-                 autospawn: bool = True, error_class: type[Exception] | None = None):
+                 autospawn: bool = True, error_class: type[Exception] | None = None,
+                 api_key: str | None = None):
         if startup_seconds <= 0 or request_seconds <= 0:
             raise ValueError("Wind timeouts must be positive")
         # Kept for compatibility/introspection; the daemon owns SDK loading and
@@ -53,10 +56,18 @@ class WindClient:
         self.request_seconds = request_seconds
         self.history_cache_dir = Path(history_cache_dir) if history_cache_dir else None
         self.client_name = client_name or default_client_name()
-        self.autospawn = autospawn
         if error_class is not None:
             self.error_class = error_class
-        self.transport = Transport(base_url=base_url, socket_path=socket_path, client_name=self.client_name)
+        self.transport = Transport(base_url=base_url, socket_path=socket_path, client_name=self.client_name,
+                                   api_key=api_key)
+        # A workstation (remote mode) uses the hub's session; never start a local windd.
+        self.autospawn = autospawn and not self.transport.remote
+
+    @property
+    def remote(self) -> bool:
+        """True when talking to another Mac's LAN router with a workstation key."""
+
+        return self.transport.remote
 
     # -------------------------------------------------------------- helpers
     def _raise(self, message: str, *, kind: str = "error", code: int | None = None) -> NoReturn:

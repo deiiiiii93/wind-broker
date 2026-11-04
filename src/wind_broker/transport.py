@@ -1,10 +1,14 @@
 """HTTP transport to windd over the Unix socket (preferred) or loopback TCP,
-plus detached auto-spawn of the daemon."""
+plus detached auto-spawn of the daemon.
+
+Remote mode (a workstation key from ``api_key=`` or ``WIND_BROKER_KEY``) talks
+to another Mac's LAN router at ``WIND_BROKER_URL`` instead; it never touches
+the local socket, token or daemon, and imports nothing macOS-only.
+"""
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import http.client
 import json
 import os
@@ -17,7 +21,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import __version__
-from .config import BrokerConfig, broker_home, load_config, read_token
+from .config import LOOPBACK_HOSTS, BrokerConfig, broker_home, load_config, read_token
 from .errors import DaemonUnavailable, ProviderError
 
 
@@ -38,21 +42,46 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class Transport:
-    """Minimal JSON-over-HTTP client. Env overrides: WIND_BROKER_URL, WIND_BROKER_SOCKET."""
+    """Minimal JSON-over-HTTP client.
+
+    Env overrides: WIND_BROKER_URL, WIND_BROKER_SOCKET, and WIND_BROKER_KEY
+    (a workstation key: switches to remote mode against a hub's LAN router).
+    """
 
     def __init__(self, *, base_url: str | None = None, socket_path: str | None = None,
-                 client_name: str = "python", config: BrokerConfig | None = None):
+                 client_name: str = "python", config: BrokerConfig | None = None, api_key: str | None = None):
         self.config = config or _safe_config()
         base_url = base_url or os.environ.get("WIND_BROKER_URL")
-        socket_path = socket_path or os.environ.get("WIND_BROKER_SOCKET")
-        if base_url:
+        self.api_key = api_key or os.environ.get("WIND_BROKER_KEY") or None
+        if self.api_key:
+            if not base_url:
+                raise ValueError("remote mode needs a hub URL: pass base_url= or set WIND_BROKER_URL "
+                                 "(e.g. http://hub-mac.local:18882)")
+            self.base_url = base_url.rstrip("/")
+            self.socket_path = None  # a workstation key is only for the hub's router
+        elif base_url:
             # An explicit URL means TCP only, unless a socket is also given.
             self.base_url = base_url.rstrip("/")
-            self.socket_path = socket_path
+            self.socket_path = socket_path or os.environ.get("WIND_BROKER_SOCKET")
         else:
             self.base_url = f"http://{self.config.host}:{self.config.port}"
+            socket_path = socket_path or os.environ.get("WIND_BROKER_SOCKET")
             self.socket_path = socket_path or (str(self.config.socket_path) if self.config.socket_path else None)
         self.client_name = client_name
+
+    @property
+    def remote(self) -> bool:
+        return bool(self.api_key)
+
+    def _auth_token(self, *, unix: bool) -> str | None:
+        """Credential for one connection: the workstation key, or the local token
+        only for the Unix socket and loopback TCP (never over the network)."""
+
+        if self.api_key:
+            return self.api_key
+        if unix or (urlsplit(self.base_url).hostname or "") in LOOPBACK_HOSTS:
+            return read_token()  # re-read: a freshly spawned daemon may have just created it
+        return None
 
     def _connections(self, timeout: float):
         if self.socket_path and os.path.exists(self.socket_path):
@@ -67,11 +96,13 @@ class Transport:
                    "Accept": "application/json"}
         if payload is not None:
             headers["Content-Type"] = "application/json"
-        token = read_token()  # re-read: a freshly spawned daemon may have just created it
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         last_error: Exception | None = None
         for connection in self._connections(timeout):
+            token = self._auth_token(unix=isinstance(connection, UnixHTTPConnection))
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            else:
+                headers.pop("Authorization", None)
             try:
                 try:
                     connection.connect()
@@ -132,6 +163,7 @@ def daemon_command(config: BrokerConfig | None = None) -> tuple[list[str], dict[
         # __pycache__ next to it (that invalidates the code signature).
         env.setdefault("PYTHONPYCACHEPREFIX", str(broker_home() / "pycache"))
     env.pop("WIND_BROKER_URL", None)
+    env.pop("WIND_BROKER_KEY", None)
     return [python, "-m", "wind_broker.daemon"], env
 
 
@@ -141,6 +173,8 @@ def spawn_daemon(*, transport: Transport | None = None, wait_seconds: float = 30
     A file lock prevents a stampede when several processes discover the daemon
     is down at the same moment.
     """
+
+    import fcntl  # POSIX-only; imported here so remote clients work on Windows
 
     transport = transport or Transport()
     home = broker_home()
