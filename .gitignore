@@ -2,3 +2,7 @@ dist/
 __pycache__/
 *.egg-info/
 .pytest_cache/
+
+# Local tool/agent state (dot folders); keep CI config if added later
+.*/
+!.github/
