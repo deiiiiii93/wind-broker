@@ -19,6 +19,7 @@ import secrets
 import socket
 import tempfile
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,8 @@ ROUTER_SOCKET_TIMEOUT = 30.0
 ROUTER_MAX_CONNECTIONS = 64
 STATUS_PATHS = frozenset({"/v1/status", "/v1/health", "/health"})
 PUBLIC_STATUS_KEYS = ("version", "state", "connected", "connected_since", "last_active_at")
+REJECT_LOG_INTERVAL = 60.0  # seconds between "rejected key" warnings per address
+ADDRESS_CACHE_SECONDS = 60.0
 
 
 def registry_path() -> Path:
@@ -103,7 +106,7 @@ class ClientRegistry:
     def add(self, name: str) -> str:
         """Issue a key for a new workstation. The plaintext key is returned once."""
 
-        if not isinstance(name, str) or not CLIENT_NAME.match(name):
+        if not isinstance(name, str) or not CLIENT_NAME.fullmatch(name):
             raise ValueError("client name must be 1-40 characters: letters, digits, '.', '_' or '-', "
                              "starting with a letter or digit")
         key = KEY_PREFIX + secrets.token_urlsafe(32)
@@ -191,10 +194,13 @@ class RouterHandler(JSONHandler):
         super().setup()
 
     def _authenticate(self) -> str | None:
+        if self.server is not self.router.active_server:
+            # The router was disabled or rebound while this keep-alive connection was open.
+            self._fail(503, "unavailable", "the LAN router on this hub is disabled")
+            return None
         name = self.router.registry.verify(self._supplied_token())
         if name is None:
-            log.warning("router: rejected request from %s (missing or invalid workstation key)",
-                        self.address_string())
+            self.router.note_rejection(self.address_string())
             self._fail(401, "unauthorized", "missing or invalid workstation key; send "
                                             "'Authorization: Bearer <key issued by the hub>'")
         return name
@@ -265,23 +271,45 @@ class _RouterHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], handler: type[RouterHandler]):
         self._slots = threading.BoundedSemaphore(ROUTER_MAX_CONNECTIONS)
+        self._open: set[socket.socket] = set()
+        self._open_lock = threading.Lock()
         super().__init__(address, handler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._slots.acquire(blocking=False):
             self.shutdown_request(request)  # too many open LAN connections: drop this one
             return
+        with self._open_lock:
+            self._open.add(request)
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self._slots.release()
+            self._forget(request)
             raise
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            self._forget(request)
+
+    def _forget(self, request: Any) -> None:
+        with self._open_lock:
+            if request not in self._open:
+                return
+            self._open.discard(request)
+        self._slots.release()
+
+    def cut_connections(self) -> None:
+        """Hang up every open connection (keep-alive clients included)."""
+
+        with self._open_lock:
+            sockets = list(self._open)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 class _RouterHTTPServerV6(_RouterHTTPServer):
@@ -319,8 +347,15 @@ class Router:
         self._server: _RouterHTTPServer | None = None
         self._applied: tuple[bool, str, int] | None = None
         self._bind_error: str | None = None
+        self._closed = False
+        self._rejections: dict[str, float] = {}
+        self._addresses: tuple[float, list[str]] = (0.0, [])
         if self.registry.error:
             log.warning("router: %s", self.registry.error)
+
+    @property
+    def active_server(self) -> "_RouterHTTPServer | None":
+        return self._server
 
     @property
     def listening(self) -> bool:
@@ -338,8 +373,11 @@ class Router:
     def apply(self) -> None:
         """Start, stop or rebind to match the config. Never raises on bind errors."""
 
-        desired = (bool(self.config.router_enabled), str(self.config.router_host), int(self.config.router_port))
         with self._lock:
+            if self._closed:
+                return  # daemon is shutting down
+            desired = (bool(self.config.router_enabled), str(self.config.router_host),
+                       int(self.config.router_port))
             if desired == self._applied:
                 return
             self._stop_locked()
@@ -371,11 +409,35 @@ class Router:
         if server is not None:
             server.shutdown()
             server.server_close()
+            server.cut_connections()
             log.info("router: LAN listener stopped")
 
     def stop(self) -> None:
+        """Final stop at daemon shutdown: later ``apply()`` calls are ignored."""
+
         with self._lock:
+            self._closed = True
             self._stop_locked()
+
+    def note_rejection(self, addr: str) -> None:
+        """Log a bad key at most once per address per interval (no pre-auth log flooding)."""
+
+        now = time.monotonic()
+        with self._lock:
+            if now - self._rejections.get(addr, -REJECT_LOG_INTERVAL) < REJECT_LOG_INTERVAL:
+                return
+            if len(self._rejections) > 1024:
+                self._rejections.clear()
+            self._rejections[addr] = now
+        log.warning("router: rejected request from %s (missing or invalid workstation key; "
+                    "further rejections from it are not logged for %gs)", addr, REJECT_LOG_INTERVAL)
+
+    def addresses(self) -> list[str]:
+        stamp, cached = self._addresses
+        if time.monotonic() - stamp > ADDRESS_CACHE_SECONDS or not stamp:
+            cached = lan_addresses()
+            self._addresses = (time.monotonic(), cached)
+        return cached
 
     def summary(self) -> dict[str, Any]:
         """Compact form for the local ``/v1/status``."""
@@ -388,5 +450,5 @@ class Router:
 
         return {"ok": True, "enabled": bool(self.config.router_enabled), "host": self.config.router_host,
                 "port": self.port, "listening": self.listening, "error": self.error,
-                "max_inflight": self.config.router_max_inflight, "addresses": lan_addresses(),
+                "max_inflight": self.config.router_max_inflight, "addresses": self.addresses(),
                 "hostname": socket.gethostname(), "clients": self.registry.clients()}

@@ -79,7 +79,7 @@ def test_registry_add_verify_revoke_and_persist(home):
     assert ClientRegistry().verify(key) is None
 
 
-@pytest.mark.parametrize("name", ["", "-lead", "has space", "x" * 41, "a/b", "über"])
+@pytest.mark.parametrize("name", ["", "-lead", "has space", "x" * 41, "a/b", "über", "jack\n"])
 def test_registry_rejects_bad_names(home, name):
     from wind_broker.router import ClientRegistry
 
@@ -321,6 +321,46 @@ def test_router_toggles_live_without_touching_session(daemon):
     assert after["worker_pid"] == before["worker_pid"] and after["connected"]
     saved = json.loads(daemon.daemon.config_file.read_text())
     assert saved["router_port"] == 0  # the resolved port is never persisted
+
+
+def test_disabling_router_cuts_open_keepalive_connections(hub):
+    import http.client
+
+    running = hub()
+    key = add_client(running, "olga")
+    connection = http.client.HTTPConnection("127.0.0.1", running.daemon.router.port, timeout=10)
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        connection.request("GET", "/v1/status", headers=headers)
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 200 and not response.will_close
+        running.client().set_config(router_enabled=False)
+        try:
+            connection.request("GET", "/v1/status", headers=headers)
+            response = connection.getresponse()
+            response.read()
+            served = response.status
+        except (OSError, http.client.HTTPException):
+            served = None  # connection was cut: the expected outcome
+        assert served != 200
+    finally:
+        connection.close()
+
+
+def test_rejected_post_closes_the_connection(hub):
+    import http.client
+
+    running = hub()
+    connection = http.client.HTTPConnection("127.0.0.1", running.daemon.router.port, timeout=10)
+    try:
+        connection.request("POST", "/v1/call", body=b'{"method": "wsd"}',
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 401 and response.will_close  # unread body never parsed as a request
+    finally:
+        connection.close()
 
 
 def test_router_port_in_use_is_not_fatal(make_daemon):

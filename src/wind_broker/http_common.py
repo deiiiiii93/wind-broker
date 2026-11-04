@@ -32,10 +32,14 @@ class JSONHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(payload)
 
     def _fail(self, status: int, kind: str, message: str) -> None:
+        # The request body may be unread: hang up rather than parse it as the next request.
+        self.close_connection = True
         self._send(status, {"ok": False, "error": {"kind": kind, "code": None, "message": message}})
 
     def _error(self, exc: BrokerError) -> None:
