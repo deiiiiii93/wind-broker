@@ -71,6 +71,10 @@ final class BrokerStore: ObservableObject {
     @Published private(set) var testError: String?
     @Published private(set) var testRunning = false
 
+    @Published private(set) var routerInfo: RouterInfo?
+    /// One-time workstation key; shown in a sheet and cleared when it is dismissed.
+    @Published var newRouterKey: RouterClientCreated?
+
     private var api: BrokerAPI
     private var pollTask: Task<Void, Never>?
 
@@ -234,6 +238,12 @@ final class BrokerStore: ObservableObject {
 
     func saveConfig() async {
         await perform("Saving configuration") {
+            // Router settings may have changed elsewhere (windctl router enable, Router tab);
+            // never send the stale in-memory copy. The daemon persists config.json on every change.
+            if let fresh = BrokerStore.readConfigFile() {
+                config.copyRouterFields(from: fresh)
+                savedConfig.copyRouterFields(from: fresh)
+            }
             if daemonRunning {
                 let response: ConfigUpdateResponse = try await api.post("v1/config", body: config.jsonObject)
                 restartRequired = response.restartRequired
@@ -251,6 +261,58 @@ final class BrokerStore: ObservableObject {
             restartRequired = []
             reloadAPI()
             return "Configuration written to \(BrokerPaths.config.path)."
+        }
+    }
+
+    // MARK: LAN router
+
+    func refreshRouter() async {
+        if let info: RouterInfo = try? await api.get("v1/router") { routerInfo = info }
+    }
+
+    /// Apply a router config response without marking the Configuration tab as edited.
+    private func adopt(_ response: ConfigUpdateResponse) {
+        routerInfo = response.router ?? routerInfo
+        config.copyRouterFields(from: response.config)
+        savedConfig.copyRouterFields(from: response.config)
+    }
+
+    /// Posts ONLY router_* keys so unrelated (unsaved) Configuration edits are never sent.
+    func saveRouter(enabled: Bool, host: String, port: Int, maxInflight: Int) async {
+        await perform("Saving router settings") {
+            var update = BrokerConfig()
+            update.routerEnabled = enabled
+            update.routerHost = host
+            update.routerPort = port
+            update.routerMaxInflight = maxInflight
+            let response: ConfigUpdateResponse = try await api.post("v1/config", body: update.routerJSONObject)
+            adopt(response)
+            return enabled ? "Router settings applied." : "Router disabled."
+        }
+    }
+
+    func setRouterEnabled(_ enabled: Bool) async {
+        await perform(enabled ? "Enabling router" : "Disabling router") {
+            let response: ConfigUpdateResponse = try await api.post("v1/config", body: ["router_enabled": enabled])
+            adopt(response)
+            return enabled ? "Router enabled." : "Router disabled."
+        }
+    }
+
+    func addRouterClient(_ name: String) async {
+        await perform("Adding workstation") {
+            let created: RouterClientCreated = try await api.post("v1/router/clients", body: ["name": name])
+            newRouterKey = created
+            await refreshRouter()
+            return nil
+        }
+    }
+
+    func revokeRouterClient(_ name: String) async {
+        await perform("Revoking workstation") {
+            let _: Ignored = try await api.post("v1/router/clients/revoke", body: ["name": name])
+            await refreshRouter()
+            return "Revoked \(name)."
         }
     }
 

@@ -10,6 +10,7 @@ struct ControlPanelView: View {
             LogsTab().tabItem { Label("Live Requests", systemImage: "list.bullet.rectangle") }
             TestConsoleTab().tabItem { Label("Test Console", systemImage: "play.rectangle") }
             ConfigTab().tabItem { Label("Configuration", systemImage: "gearshape") }
+            RouterTab().tabItem { Label("Router", systemImage: "network") }
         }
         .padding()
         .onAppear(perform: activateApp)
@@ -371,5 +372,211 @@ struct ConfigTab: View {
                 if panel.runModal() == .OK, let url = panel.url { text.wrappedValue = url.path }
             }
         }
+    }
+}
+
+
+// MARK: - Router (LAN sharing)
+
+struct RouterTab: View {
+    @EnvironmentObject private var store: BrokerStore
+    @State private var host = ""
+    @State private var port = 18882
+    @State private var maxInflight = 2
+    @State private var loaded = false
+    @State private var newName = ""
+    @State private var revoking: RouterClient?
+
+    private var info: RouterInfo? { store.routerInfo }
+    private var dirty: Bool {
+        guard let info else { return false }
+        return host != info.host || port != store.config.routerPort || maxInflight != info.maxInflight
+    }
+    /// info.port is the bound port while listening, else the configured one.
+    private var shownPort: Int { info?.port ?? port }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("LAN router").font(.title2.bold())
+                    Spacer()
+                    if let action = store.busyAction {
+                        ProgressView().controlSize(.small)
+                        Text(action).foregroundStyle(.secondary)
+                    }
+                }
+                if let banner = store.banner {
+                    Text(banner).foregroundStyle(store.bannerIsError ? .red : .secondary)
+                }
+
+                GroupBox("Sharing") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Share this Wind session with workstations on the LAN", isOn: Binding(
+                            get: { info?.enabled ?? false },
+                            set: { enabled in Task { await store.setRouterEnabled(enabled) } }
+                        ))
+                        .toggleStyle(.switch)
+                        .disabled(!store.daemonRunning || store.busyAction != nil)
+                        Label("Sharing Wind data with other computers must be within your Wind agreement and entitlement. The router speaks plain HTTP and is for a trusted LAN only; do not expose it to the internet.",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let info {
+                            HStack(spacing: 6) {
+                                Circle().fill(info.listening ? Color.green : Color.gray).frame(width: 9, height: 9)
+                                Text(info.listening ? "Listening on \(info.host):\(info.port)" : (info.enabled ? "Enabled, not listening" : "Disabled"))
+                            }
+                            if let error = info.error, !error.isEmpty {
+                                Label(error, systemImage: "xmark.octagon").foregroundStyle(.red).textSelection(.enabled)
+                            }
+                        } else {
+                            Text(store.daemonRunning ? "Loading…" : "Start the daemon to manage the router.")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                GroupBox("Listener") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            TextField("Host", text: $host).frame(maxWidth: 200)
+                            TextField("Port", value: $port, format: .number.grouping(.never)).frame(width: 90)
+                            TextField("Max in-flight", value: $maxInflight, format: .number.grouping(.never)).frame(width: 110)
+                            Button("Apply") {
+                                Task { await store.saveRouter(enabled: info?.enabled ?? false, host: host, port: port, maxInflight: maxInflight) }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!dirty || !store.daemonRunning || store.busyAction != nil)
+                            Spacer()
+                        }
+                        Text("Host 0.0.0.0 listens on every interface. Max in-flight is the number of simultaneous Wind queries allowed per workstation. Changes apply live.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let info, !info.addresses.isEmpty {
+                            Text("Workstations connect to").font(.caption).foregroundStyle(.secondary)
+                            Text(info.addresses.map { routerURL($0, port: shownPort) }.joined(separator: "\n"))
+                                .font(.callout.monospaced())
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(6)
+                }
+
+                GroupBox("Workstations") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Table(info?.clients ?? []) {
+                            TableColumn("Name", value: \.name).width(min: 90, ideal: 130)
+                            TableColumn("Created") { Text(Format.timestamp($0.createdAt)).monospacedDigit() }.width(min: 110, ideal: 140)
+                            TableColumn("Last seen") { Text(Format.timestamp($0.lastSeenAt)).monospacedDigit() }.width(min: 110, ideal: 140)
+                            TableColumn("Last address") { Text($0.lastAddr ?? "—") }.width(min: 90, ideal: 120)
+                            TableColumn("Requests") { Text(String($0.requests)).monospacedDigit() }.width(min: 60, ideal: 70)
+                            TableColumn("In-flight") { Text(String($0.inflight)).monospacedDigit() }.width(min: 60, ideal: 70)
+                            TableColumn("") { client in
+                                Button("Revoke", role: .destructive) { revoking = client }
+                                    .disabled(store.busyAction != nil)
+                            }
+                            .width(min: 70, ideal: 80)
+                        }
+                        .frame(minHeight: 140, idealHeight: 180)
+                        HStack {
+                            TextField("New workstation name (e.g. alice-pc)", text: $newName)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 300)
+                                .onSubmit(addClient)
+                            Button { addClient() } label: { Label("Add workstation", systemImage: "plus") }
+                                .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty || !store.daemonRunning || store.busyAction != nil)
+                            Spacer()
+                        }
+                        Text("Names: letters, digits, dot, dash, underscore (max 40). Each workstation gets its own key; revoke it here to cut it off immediately.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(6)
+                }
+            }
+            .padding()
+        }
+        .task {
+            // Refresh while the tab is on screen; the task is cancelled when it disappears.
+            while !Task.isCancelled {
+                await store.refreshRouter()
+                if let info = store.routerInfo, !loaded {
+                    host = info.host
+                    port = store.config.routerPort
+                    maxInflight = info.maxInflight
+                    loaded = true
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+        .confirmationDialog("Revoke \(revoking?.name ?? "")?", isPresented: Binding(
+            get: { revoking != nil }, set: { if !$0 { revoking = nil } }
+        )) {
+            Button("Revoke", role: .destructive) {
+                if let client = revoking { Task { await store.revokeRouterClient(client.name) } }
+                revoking = nil
+            }
+        } message: {
+            Text("The workstation's key stops working immediately and its open connections are closed.")
+        }
+        .sheet(item: $store.newRouterKey) { created in
+            NewKeySheet(created: created, url: routerURL(info?.addresses.first ?? info?.hostname ?? "<hub-address>", port: shownPort))
+        }
+    }
+
+    private func addClient() {
+        let name = newName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        newName = ""
+        Task { await store.addRouterClient(name) }
+    }
+
+    private func routerURL(_ address: String, port: Int) -> String {
+        let shown = address.contains(":") ? "[\(address)]" : address
+        return "http://\(shown):\(port)"
+    }
+}
+
+extension RouterClientCreated: Identifiable {
+    var id: String { name }
+}
+
+private struct NewKeySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let created: RouterClientCreated
+    let url: String
+
+    private var snippet: String { "WIND_BROKER_URL=\(url)\nWIND_BROKER_KEY=\(created.key)" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Key for \(created.name)").font(.title3.bold())
+            Label("This key is shown only once and will not be shown again. Copy it now; if it is lost, revoke the workstation and add it again.",
+                  systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Set these on the workstation:").font(.caption).foregroundStyle(.secondary)
+            Text(snippet)
+                .font(.callout.monospaced())
+                .textSelection(.enabled)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+            HStack {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(snippet, forType: .string)
+                } label: { Label("Copy", systemImage: "doc.on.doc") }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
     }
 }

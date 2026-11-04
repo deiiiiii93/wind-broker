@@ -12,6 +12,10 @@ struct BrokerConfig: Codable, Equatable {
     var requestSeconds: Double = 90
     var autoConnectOnStart: Bool = false
     var historyCacheDir: String? = nil
+    var routerEnabled: Bool = false
+    var routerHost: String = "0.0.0.0"
+    var routerPort: Int = 18882
+    var routerMaxInflight: Int = 2
 
     init() {}
 
@@ -28,6 +32,10 @@ struct BrokerConfig: Codable, Equatable {
         requestSeconds = try c.decodeIfPresent(Double.self, forKey: .requestSeconds) ?? d.requestSeconds
         autoConnectOnStart = try c.decodeIfPresent(Bool.self, forKey: .autoConnectOnStart) ?? d.autoConnectOnStart
         historyCacheDir = try c.decodeIfPresent(String.self, forKey: .historyCacheDir)
+        routerEnabled = try c.decodeIfPresent(Bool.self, forKey: .routerEnabled) ?? d.routerEnabled
+        routerHost = try c.decodeIfPresent(String.self, forKey: .routerHost) ?? d.routerHost
+        routerPort = try c.decodeIfPresent(Int.self, forKey: .routerPort) ?? d.routerPort
+        routerMaxInflight = try c.decodeIfPresent(Int.self, forKey: .routerMaxInflight) ?? d.routerMaxInflight
     }
 
     /// JSON body for POST /v1/config and for writing config.json directly.
@@ -38,7 +46,24 @@ struct BrokerConfig: Codable, Equatable {
             "startup_seconds": Int(startupSeconds), "request_seconds": requestSeconds,
             "auto_connect_on_start": autoConnectOnStart,
             "history_cache_dir": (historyCacheDir?.isEmpty ?? true) ? NSNull() : historyCacheDir as Any,
+            "router_enabled": routerEnabled, "router_host": routerHost,
+            "router_port": routerPort, "router_max_inflight": routerMaxInflight,
         ]
+    }
+
+    /// The LAN-router keys alone: the only body the Router tab ever posts to /v1/config.
+    var routerJSONObject: [String: Any] {
+        [
+            "router_enabled": routerEnabled, "router_host": routerHost,
+            "router_port": routerPort, "router_max_inflight": routerMaxInflight,
+        ]
+    }
+
+    mutating func copyRouterFields(from other: BrokerConfig) {
+        routerEnabled = other.routerEnabled
+        routerHost = other.routerHost
+        routerPort = other.routerPort
+        routerMaxInflight = other.routerMaxInflight
     }
 }
 
@@ -58,6 +83,43 @@ struct BrokerStatus: Codable {
     var loginCount: Int?
     var sdkInstalled: Bool?
     var config: BrokerConfig?
+    var router: RouterSummary?  // absent on daemons without the LAN router
+}
+
+struct RouterSummary: Codable {
+    var enabled: Bool
+    var listening: Bool
+    var port: Int
+    var clients: Int
+}
+
+struct RouterClient: Codable, Identifiable, Hashable {
+    var name: String
+    var createdAt: String
+    var lastSeenAt: String?
+    var lastAddr: String?
+    var inflight: Int
+    var requests: Int
+
+    var id: String { name }
+}
+
+struct RouterInfo: Codable {
+    var enabled: Bool
+    var host: String
+    var port: Int
+    var listening: Bool
+    var error: String?
+    var maxInflight: Int
+    var addresses: [String]
+    var hostname: String
+    var clients: [RouterClient]
+}
+
+/// Response of POST /v1/router/clients; `key` is returned exactly once.
+struct RouterClientCreated: Codable {
+    var name: String
+    var key: String
 }
 
 struct LogEntry: Codable, Identifiable, Hashable {
@@ -103,6 +165,7 @@ struct TestResult: Codable {
 struct ConfigUpdateResponse: Codable {
     var config: BrokerConfig
     var restartRequired: [String]
+    var router: RouterInfo?
 }
 
 struct ErrorEnvelope: Codable {
